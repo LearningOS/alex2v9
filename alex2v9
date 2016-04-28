@@ -1,3 +1,4 @@
+#!/usr/bin/env ruby
 infile = ARGV[0]
 outfile = ARGV[1]
 
@@ -63,11 +64,11 @@ text[:content] = parse_section_content(section_content, 'text')
 data[:content] = parse_section_content(section_content, 'data') if data
 rodata[:content] = parse_section_content(section_content, 'rodata') if rodata
 
-def fill_v9_header(file_data, entry_point, data_offset)
-  file_data[0...4]  = [0xC0DEF00D].pack('L')
-  file_data[8...12] = [entry_point].pack('L')
-  file_data[12...16] = [data_offset].pack('L')
-  16
+def gen_v9_header(entry_point, data_offset)
+  [0xC0DEF00D].pack('L') +      # magic
+    ([0] * 4).pack('C*') +      # bss
+    [entry_point].pack('L') +   # text
+    [data_offset].pack('L')     # data
 end
 def fill_section(file_data, section)
   if section[:content]
@@ -81,9 +82,9 @@ file_size = last_section[:vma] + last_section[:size]
 
 file_data = ([0]*file_size).pack('C*')
 
-fill_v9_header(file_data, entry_point, text[:vma]+text[:size])
+header = gen_v9_header(entry_point, text[:vma]+text[:size])
 fill_section(file_data, text)
 fill_section(file_data, rodata) if rodata
 fill_section(file_data, data) if data
 
-File.write(outfile, file_data)
+File.write(outfile, header + file_data)
