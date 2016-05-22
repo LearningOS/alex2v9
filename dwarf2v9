@@ -1,43 +1,25 @@
 #!/usr/bin/env ruby
+require './debug_lines'
 require 'json'
 require 'pp'
 if ARGV.size != 2
-  raise 'wrong parameter'
+  puts 'usage ./dwarf2v9 infile outfile'
+  exit
 end
 
 OBJDUMP = 'objdump'
+READELF = 'readelf'
 
+begin
+  `#{OBJDUMP} --help`
+rescue
+  puts 'please install objdump and readelf'
+  exit
+end
 
 infile, outfile = ARGV
 
-content = {}
-###########################################
-## Line number and pc
-
-info = `#{OBJDUMP} --dwarf=decodedline #{infile}`
-
-def is_number? string
-  true if Float(string) rescue false
-end
-
-current_file = nil
-dbg_lines = {}
-info.each_line do |line|
-  if line =~ /^CU:\s+(.*):.*$/
-    current_file = $1
-  elsif line =~/^\s*$/
-  elsif current_file
-    file, lineno, addr = line.split
-    next unless is_number?(lineno)
-    if dbg_lines.key? current_file
-      dbg_lines[current_file][lineno.to_i] = addr.to_i(16)
-    else
-      dbg_lines[current_file] = { lineno.to_i => addr.to_i(16) }
-    end
-  end
-end
-
-content[:debugLines] = dbg_lines
+@dbg_lines = parse_debug_lines(infile)
 
 #########################################
 ## DWARF info
@@ -165,22 +147,25 @@ root[:children].each do |compile_unit|
   compile_unit[:children].each do |item|
     case item[:type]
       when 'DW_TAG_const_type'
-        @types[item[:offset]] = parse_simple_type(item, :const)
+        @types[item[:offset]] = item #parse_simple_type(item, :const)
       when 'DW_TAG_pointer_type'
-        @types[item[:offset]] = parse_simple_type(item, :pointer)
+        @types[item[:offset]] = item #parse_simple_type(item, :pointer)
       when 'DW_TAG_typedef'
-        @types[item[:offset]] = parse_simple_type(item, :typedef)
+        @types[item[:offset]] = item #parse_simple_type(item, :typedef)
       when 'DW_TAG_base_type'
-        t =  {
-            type:     :basic,
-            name:     parse_dwarf_string(item['DW_AT_name'][:value]),
-            encoding: item['DW_AT_encoding'][:value].strip.split("\t").last[1...-1],
-            size:     item['DW_AT_byte_size'][:value].to_i(16)
-        }
-        @types[item[:offset]] = t
+        # t =  {
+        #     type:     :basic,
+        #     name:     parse_dwarf_string(item['DW_AT_name'][:value]),
+        #     encoding: item['DW_AT_encoding'][:value].strip.split("\t").last[1...-1],
+        #     size:     item['DW_AT_byte_size'][:value].to_i(16)
+        # }
+        @types[item[:offset]] = item
+      when 'DW_TAG_array_type'
+        @types[item[:offset]] = item #parse_simple_type(item, :array)
       when 'DW_TAG_structure_type'
+        @types[item[:offset]] = item
       when 'DW_TAG_subroutine_type'
-        ##pp item
+        @types[item[:offset]] = item
       when 'DW_TAG_variable'
         v = parse_variable(item)
         @variables[v[:name]] = v
@@ -230,7 +215,175 @@ root[:children].each do |compile_unit|
   end
 end
 
-content[:types] = @types
-content[:functions] = @functions
-content[:variables] = @variables
-File.write outfile, content.to_json
+if outfile == '-'
+  out_io = STDOUT
+else
+  out_io = open(outfile, 'w')
+end
+
+def get_base_type(str)
+  {
+      name: str.gsub(/long /, '').gsub(/unsigned /, 'u'),
+      size: case str
+              when /char/
+                1
+              when /short/
+                2
+              when /int/
+                4
+              else
+                -1
+            end
+  }
+end
+
+def get_struct_size(st)
+  size, _ = get_struct_def(st)
+  size
+end
+
+def get_t(t)
+  case t[:type]
+    when 'DW_TAG_base_type'
+      get_base_type(parse_dwarf_string(t['DW_AT_name'][:value]))
+    when 'DW_TAG_const_type'
+      if t['DW_AT_type'][:value] =~ /0x([0-9a-f]+)/
+        get_t(@types[$1.to_i(16)])
+      else
+        raise RuntimeError
+      end
+    when 'DW_TAG_pointer_type'
+      if t['DW_AT_type'][:value] =~ /0x([0-9a-f]+)/
+        {
+            name: 'ptr(' + get_t(@types[$1.to_i(16)])[:name] + ')',
+            size: 4
+        }
+      else
+        raise RuntimeError
+      end
+    when 'DW_TAG_array_type'
+      if t['DW_AT_type'][:value] =~ /0x([0-9a-f]+)/
+        child = t[:children].first
+        if child[:type] == 'DW_TAG_subrange_type'
+          size = child['DW_AT_count'][:value].strip.to_i
+          inner_t = @types[$1.to_i(16)]
+          th = get_t(inner_t)
+          {
+              name: "array(#{size}|#{th[:size]}(#{th[:name]}))",
+              size: size * th[:size]
+          }
+        else
+          raise RuntimeError, 'DWARF array does\'nt have a count field'
+        end
+      else
+        raise RuntimeError
+      end
+    when 'DW_TAG_typedef'
+      if t['DW_AT_type'][:value] =~ /0x([0-9a-f]+)/
+        th = get_t(@types[$1.to_i(16)])
+        {
+            name: th[:name],
+            size: th[:size]
+        }
+      else
+        raise RuntimeError
+      end
+    when 'DW_TAG_structure_type'
+      {
+          name: "struct<#{parse_dwarf_string(t['DW_AT_name'][:value])}>",
+          size: get_struct_size(t)
+      }
+    when 'DW_TAG_subroutine_type'
+      { name: 'fun', size: 4 }
+    else
+      raise RuntimeError, 'unknown dwarf type'
+  end
+end
+
+def get_v9_type_str(off)
+  if off == nil
+    raise RuntimeError, 'get_v9_type_str parameter error'
+  end
+  t = @types[off]
+  return 'void' unless t
+  "(#{get_t(t)[:name]})"
+end
+
+
+def get_struct_def(struct)
+  def_str = ''
+  size = 0
+  last_member_size = 0
+  last_member_off = 0
+  struct[:children].each do |member|
+    if member[:type] == 'DW_TAG_member'
+      name = parse_dwarf_string member['DW_AT_name'][:value]
+      offset = member['DW_AT_data_member_location'][:value].strip.to_i
+      last_member_off = offset
+      if member['DW_AT_type'][:value] =~ /0x([0-9a-f]+)/i
+        type = get_t(@types[$1.to_i(16)])
+        def_str += "(#{name}:+#{offset}:#{type[:name]})"
+        last_member_size = type[:size]
+      else
+        raise RuntimeError, 'dwarf type format error'
+      end
+    end
+  end
+  [last_member_size + last_member_off, def_str]
+end
+
+
+out_io.puts "= #{infile}"
+
+# global variables
+out_io.puts '# global variables'
+@variables.each do |name, val|
+  out_io.puts "g #{name} data +#{val[:location][:offset]} #{get_v9_type_str(val[:typeOffset])}"
+end
+out_io.puts
+
+# functions
+out_io.puts '# functions'
+@functions.each do |name, fn|
+  out_io.puts "< 0x#{fn[:startAddress].to_s(16)}"
+  fn[:localVariables].each_with_index do |local_var, i|
+    out_io.puts "l #{local_var[:name]} stk +#{i * 4} #{get_v9_type_str(local_var[:typeOffset])}"
+  end
+  @dbg_lines.each do |file, dblines|
+    dblines.each do |l, pc|
+      if fn[:startAddress] <= pc && pc < fn[:startAddress] + fn[:size]
+        out_io.puts "i 0x#{(pc - fn[:startAddress]).to_s(16)} #{file} #{l}"
+      end
+    end
+  end
+  out_io.puts
+end
+
+# structs
+out_io.puts '# structures'
+@types.each do |id, type|
+  if type[:type] == 'DW_TAG_structure_type'
+    size, def_str = get_struct_def(type)
+    out_io.puts "d struct #{parse_dwarf_string(type['DW_AT_name'][:value])} (#{size}|#{def_str})"
+  end
+  # out_io.puts "#{name}, #{type}"
+end
+out_io.puts
+
+# .data and .bss start address
+elf_header = `#{OBJDUMP} -h #{infile}`
+def parse_section_header(str, section_name)
+  return nil unless str =~ /\.#{section_name}\s+([a-f0-9]+)\s+([a-f0-9]+)\s+([a-f0-9]+)\s+([a-f0-9]+)/i
+  {
+      size: $1.to_i(16),
+      vma:  $2.to_i(16),
+      lma:  $3.to_i(16),
+      file_off: $4.to_i(16)
+  }
+end
+bss = parse_section_header(elf_header, 'bss')
+data = parse_section_header(elf_header, 'data')
+
+
+out_io.puts ".data 0x#{data[:vma].to_s(16)}"
+out_io.puts ".bss 0x#{bss[:vma].to_s(16)}"

@@ -6,9 +6,21 @@ unless infile && outfile
   exit
 end
 
-elf_header = `readelf -h #{infile}`
-section_headers = `objdump -h #{infile}`
-section_content = `llvm-objdump -arch=alex -s #{infile}`
+READELF = 'readelf'
+OBJDUMP = 'objdump'
+LLVM_OBJDUMP = 'llvm-objdump'
+begin
+  `#{READELF} --help`
+  `#{OBJDUMP} --help`
+  `#{LLVM_OBJDUMP} --help`
+rescue
+  puts 'please check your readelf, objdump and llvm-objdump'
+  exit
+end
+
+elf_header = `#{READELF} -h #{infile}`
+section_headers = `#{OBJDUMP} -h #{infile}`
+section_content = `#{LLVM_OBJDUMP} -arch=alex -s #{infile}`
 
 # parse entry point
 raise 'readelf format error' unless elf_header =~ /Entry point address:\s+0x([0-9a-f]+)$/i
