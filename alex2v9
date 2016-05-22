@@ -1,18 +1,22 @@
 #!/usr/bin/env ruby
 infile = ARGV[0]
 outfile = ARGV[1]
+unless infile && outfile
+  puts 'usage: ./alex2v9 infile outfile'
+  exit
+end
 
 elf_header = `readelf -h #{infile}`
 section_headers = `objdump -h #{infile}`
 section_content = `llvm-objdump -arch=alex -s #{infile}`
 
 # parse entry point
-raise 'readelf format error' unless elf_header =~ /Entry point address:\s+0x([0-9]+)$/i
+raise 'readelf format error' unless elf_header =~ /Entry point address:\s+0x([0-9a-f]+)$/i
 entry_point = $1.to_i(16)
 
 # parse text, bss, data section file offsets and vmas
 def parse_section_header(str, section_name)
-  return nil unless str =~ /\.#{section_name}\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/
+  return nil unless str =~ /\.#{section_name}\s+([a-f0-9]+)\s+([a-f0-9]+)\s+([a-f0-9]+)\s+([a-f0-9]+)/i
   {
       size: $1.to_i(16),
       vma:  $2.to_i(16),
@@ -50,8 +54,9 @@ def parse_section_content(str, section_name)
       end
     end
 
+
     if started && line =~ /^ \d+/
-      line_data_array = line.split(' ')[1..-1]
+      line_data_array = line.split(' ')[1..4]
       line_data_array.reject! { |l| ! (l =~ /^[0-9a-f]+$/i)}
       line_data = line_data_array.join('')
       content += hex_str_to_binary(line_data)

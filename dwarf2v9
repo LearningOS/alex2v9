@@ -1,0 +1,236 @@
+#!/usr/bin/env ruby
+require 'json'
+require 'pp'
+if ARGV.size != 2
+  raise 'wrong parameter'
+end
+
+OBJDUMP = 'objdump'
+
+
+infile, outfile = ARGV
+
+content = {}
+###########################################
+## Line number and pc
+
+info = `#{OBJDUMP} --dwarf=decodedline #{infile}`
+
+def is_number? string
+  true if Float(string) rescue false
+end
+
+current_file = nil
+dbg_lines = {}
+info.each_line do |line|
+  if line =~ /^CU:\s+(.*):.*$/
+    current_file = $1
+  elsif line =~/^\s*$/
+  elsif current_file
+    file, lineno, addr = line.split
+    next unless is_number?(lineno)
+    if dbg_lines.key? current_file
+      dbg_lines[current_file][lineno.to_i] = addr.to_i(16)
+    else
+      dbg_lines[current_file] = { lineno.to_i => addr.to_i(16) }
+    end
+  end
+end
+
+content[:debugLines] = dbg_lines
+
+#########################################
+## DWARF info
+dwarf = `#{OBJDUMP} --dwarf=info #{infile}`
+lines = dwarf.split("\n")
+
+items = []
+current_item = nil
+lines.each do |line|
+  case line
+    when /<([0-9a-f]+)><([0-9a-f]+)>:\s+Abbrev Number:\s+([0-9a-f]+)(?:\s+\(([^(]+)\))?/i
+      items << current_item if current_item
+      depth, offset, abbr, type = $1.to_i(16), $2.to_i(16), $3.to_i(16), $4
+      current_item = { type: type, depth: depth, offset: offset, abbr: abbr, children: [] }
+    when /<([0-9a-f]+)>\s+([\w_]+)\s*:(.*)$/i
+      offset, key, value = $1.to_i(16), $2, $3
+      current_item[key] = { offset: offset, value: value }
+    else
+  end
+end
+
+# create dwarf tree with a stack
+root = { type: 'root', depth: -1, offset: 0, abbr: 0, children: [], parent: nil }
+stack = [root]
+items.each do |item|
+  if stack.last[:depth] >= item[:depth]
+    stack.slice!((stack.size-(stack.last[:depth] - item[:depth] + 1))...stack.size)
+  end
+  parent = stack.last
+  item[:parent] = parent
+  parent[:children] << item
+  stack.push item
+end
+
+# traverse dwarf tree to get particular information
+@types = {}
+@functions = {}
+@variables = {}
+
+def parse_type_offset(off)
+  if off && off.key?(:value)
+    off[:value].strip[1...-1].to_i(16)
+  else
+    -1
+  end
+end
+
+def parse_simple_type(t, attr = nil)
+  if attr == :typedef
+    {
+        type:   :typedef,
+        name:   parse_dwarf_string(t['DW_AT_name'][:value]),
+        rawType: DwarfType.new(@types, t['DW_AT_type'], :typedef)
+    }
+  elsif attr == nil
+    {
+        type:   :type,
+        name:   DwarfType.new(@types, t['DW_AT_type'])
+    }
+  else
+    {
+        type:   attr,
+        name:   DwarfType.new(@types, t['DW_AT_type'], attr)
+    }
+  end
+
+end
+def parse_variable(item)
+  {
+      name: parse_dwarf_string(item['DW_AT_name'][:value]),
+      typeOffset: parse_type_offset(item['DW_AT_type']),
+      location: parse_location(item['DW_AT_location'][:value])
+  }
+end
+
+def parse_location(loc)
+  if loc.strip.split("\t")[-1][1...-1] =~ /([\w_]+):\s+(\d+)/
+    {
+        base: $1,
+        offset: $2.to_i
+    }
+  end
+end
+def parse_dwarf_string(value)
+  if value.strip =~ /\(indirect string[^)]+\):(.*)$/
+    $1.strip
+  end
+end
+
+class DwarfType
+  attr_accessor :name
+  def initialize(types, at_type, add = nil)
+    @at_type = at_type
+    @types = types
+    @add = add
+  end
+  def to_s
+    unless @str
+      @str = ''
+      if @add == :typedef
+        @str += 'typedef '
+      end
+      if @add == :const
+        @str += 'const '
+      end
+      if @at_type
+        t = @types[@at_type[:value].strip[1...-1].to_i(16)]
+        if t
+          @str += t[:name].to_s
+        else
+          @str += @at_type[:value]
+        end
+      else
+        @str += 'void'
+      end
+      if @add == :pointer
+        @str += '*'
+      end
+    end
+    @str
+  end
+end
+
+root[:children].each do |compile_unit|
+  compile_unit[:children].each do |item|
+    case item[:type]
+      when 'DW_TAG_const_type'
+        @types[item[:offset]] = parse_simple_type(item, :const)
+      when 'DW_TAG_pointer_type'
+        @types[item[:offset]] = parse_simple_type(item, :pointer)
+      when 'DW_TAG_typedef'
+        @types[item[:offset]] = parse_simple_type(item, :typedef)
+      when 'DW_TAG_base_type'
+        t =  {
+            type:     :basic,
+            name:     parse_dwarf_string(item['DW_AT_name'][:value]),
+            encoding: item['DW_AT_encoding'][:value].strip.split("\t").last[1...-1],
+            size:     item['DW_AT_byte_size'][:value].to_i(16)
+        }
+        @types[item[:offset]] = t
+      when 'DW_TAG_structure_type'
+      when 'DW_TAG_subroutine_type'
+        ##pp item
+      when 'DW_TAG_variable'
+        v = parse_variable(item)
+        @variables[v[:name]] = v
+      when 'DW_TAG_subprogram'
+        func = {}
+        name = parse_dwarf_string item['DW_AT_name'][:value]
+        raise 'no name' unless name
+        func[:name] = name
+        func[:startAddress]  = item['DW_AT_low_pc'][:value].to_i(16)
+        func[:size]           = item['DW_AT_high_pc'][:value].to_i(16)
+        func[:returnType]    = parse_type_offset(item['DW_AT_type'])
+
+        func[:arguments] = []
+        func[:localVariables] = []
+        func[:lexicalBlocks] = []
+
+        item[:children].each do |variable|
+          case variable[:type]
+            when 'DW_TAG_formal_parameter'
+              func[:arguments] << parse_variable(variable)
+            when 'DW_TAG_variable'
+              func[:localVariables] << parse_variable(variable)
+            when 'DW_TAG_unspecified_parameters'
+              # ignore
+            when 'DW_TAG_lexical_block'
+              blk = {
+                  startAddress: variable['DW_AT_low_pc'][:value].to_i(16),
+                  size: variable['DW_AT_high_pc'][:value].to_i(16),
+                  variables: []
+              }
+              variable[:children].each do |c|
+                case c[:type]
+                  when 'DW_TAG_variable'
+                    blk[:variables] << parse_variable(c)
+                  else
+                end
+              end
+              func[:lexicalBlocks] << blk
+            else
+          end
+        end
+        #  pp func
+        @functions[func[:name]] = func
+      else
+        # puts item
+    end
+  end
+end
+
+content[:types] = @types
+content[:functions] = @functions
+content[:variables] = @variables
+File.write outfile, content.to_json
