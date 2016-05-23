@@ -17,6 +17,8 @@ rescue
   exit
 end
 
+PTR_SIZE = 4
+
 infile, outfile = ARGV
 
 @dbg_lines = parse_debug_lines(infile)
@@ -109,6 +111,15 @@ def parse_dwarf_string(value)
   end
 end
 
+def parse_struct_def_in_types(item)
+  item[:children].each do |member|
+    if member[:type] == 'DW_TAG_structure_type'
+      parse_struct_def_in_types(member)
+    end
+  end
+  @types[item[:offset]] = item
+end
+
 class DwarfType
   attr_accessor :name
   def initialize(types, at_type, add = nil)
@@ -163,7 +174,7 @@ root[:children].each do |compile_unit|
       when 'DW_TAG_array_type'
         @types[item[:offset]] = item #parse_simple_type(item, :array)
       when 'DW_TAG_structure_type'
-        @types[item[:offset]] = item
+        parse_struct_def_in_types(item)
       when 'DW_TAG_subroutine_type'
         @types[item[:offset]] = item
       when 'DW_TAG_variable'
@@ -238,7 +249,7 @@ def get_base_type(str)
 end
 
 def get_struct_size(st)
-  size, _ = get_struct_def(st)
+  size, _ = get_struct_members_def(st)
   size
 end
 
@@ -253,13 +264,20 @@ def get_t(t)
         raise RuntimeError
       end
     when 'DW_TAG_pointer_type'
-      if t['DW_AT_type'][:value] =~ /0x([0-9a-f]+)/
-        {
-            name: 'ptr(' + get_t(@types[$1.to_i(16)])[:name] + ')',
-            size: 4
-        }
+      if t['DW_AT_type']
+        if t['DW_AT_type'][:value] =~ /0x([0-9a-f]+)/
+          {
+              name: 'ptr(' + get_t(@types[$1.to_i(16)])[:name] + ')',
+              size: PTR_SIZE
+          }
+        else
+          raise RuntimeError
+        end
       else
-        raise RuntimeError
+        {
+            name: 'ptr(void)',
+            size: PTR_SIZE
+        }
       end
     when 'DW_TAG_array_type'
       if t['DW_AT_type'][:value] =~ /0x([0-9a-f]+)/
@@ -289,10 +307,21 @@ def get_t(t)
         raise RuntimeError
       end
     when 'DW_TAG_structure_type'
-      {
-          name: "struct<#{parse_dwarf_string(t['DW_AT_name'][:value])}>",
-          size: get_struct_size(t)
-      }
+      # if named struct print name
+      # else expand struct
+      if t['DW_AT_name']
+        {
+            name: "struct<#{parse_dwarf_string(t['DW_AT_name'][:value])}>",
+            size: get_struct_size(t)
+        }
+      else
+        size, name = get_struct_members_def(t)
+        {
+            name: name,
+            size: size
+        }
+      end
+
     when 'DW_TAG_subroutine_type'
       { name: 'fun', size: 4 }
     else
@@ -309,27 +338,39 @@ def get_v9_type_str(off)
   "(#{get_t(t)[:name]})"
 end
 
-
-def get_struct_def(struct)
-  def_str = ''
-  size = 0
+def get_struct_members_def(struct)
+  members_str = ''
   last_member_size = 0
   last_member_off = 0
   struct[:children].each do |member|
     if member[:type] == 'DW_TAG_member'
-      name = parse_dwarf_string member['DW_AT_name'][:value]
       offset = member['DW_AT_data_member_location'][:value].strip.to_i
       last_member_off = offset
-      if member['DW_AT_type'][:value] =~ /0x([0-9a-f]+)/i
-        type = get_t(@types[$1.to_i(16)])
-        def_str += "(#{name}:+#{offset}:#{type[:name]})"
-        last_member_size = type[:size]
+
+      # named struct
+      if member['DW_AT_name']
+        name = parse_dwarf_string member['DW_AT_name'][:value]
+
+        if member['DW_AT_type'][:value] =~ /0x([0-9a-f]+)/i
+          type = get_t(@types[$1.to_i(16)])
+          members_str += "(#{name}:+#{offset}:#{type[:name]})"
+          last_member_size = type[:size]
+        else
+          raise RuntimeError, 'dwarf type format error'
+        end
       else
-        raise RuntimeError, 'dwarf type format error'
+        # unnamed struct
+        if member['DW_AT_type'][:value] =~ /0x([0-9a-f]+)/i
+          type_size, mstr = get_struct_members_def(@types[$1.to_i(16)])
+          members_str += "(??:+#{offset}:#{mstr})"
+          last_member_size = type_size
+        else
+          raise RuntimeError, 'dwarf type format error'
+        end
       end
     end
   end
-  [last_member_size + last_member_off, def_str]
+  [last_member_size + last_member_off, members_str]
 end
 
 
@@ -346,8 +387,13 @@ out_io.puts
 out_io.puts '# functions'
 @functions.each do |name, fn|
   out_io.puts "< 0x#{fn[:startAddress].to_s(16)}"
+  fn[:arguments].each_with_index do |arg, i|
+    off = - 4 - 4*5 - 4 * i
+    out_io.puts "l #{arg[:name]} stk #{off} #{get_v9_type_str(arg[:typeOffset])}"
+  end
   fn[:localVariables].each_with_index do |local_var, i|
-    out_io.puts "l #{local_var[:name]} stk +#{i * 4} #{get_v9_type_str(local_var[:typeOffset])}"
+    off = - 4 - 4*5 - fn[:arguments].size * 4 - 4 * i
+    out_io.puts "l #{local_var[:name]} stk #{off} #{get_v9_type_str(local_var[:typeOffset])}"
   end
   @dbg_lines.each do |file, dblines|
     dblines.each do |l, pc|
@@ -362,8 +408,9 @@ end
 # structs
 out_io.puts '# structures'
 @types.each do |id, type|
-  if type[:type] == 'DW_TAG_structure_type'
-    size, def_str = get_struct_def(type)
+  # print named structs
+  if type[:type] == 'DW_TAG_structure_type' && type['DW_AT_name']
+    size, def_str = get_struct_members_def(type)
     out_io.puts "d struct #{parse_dwarf_string(type['DW_AT_name'][:value])} (#{size}|#{def_str})"
   end
   # out_io.puts "#{name}, #{type}"
