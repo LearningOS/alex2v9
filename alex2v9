@@ -37,12 +37,32 @@ def parse_section_header(str, section_name)
       file_off: $4.to_i(16)
   }
 end
+def parse_data_section_header(str)
+  return nil unless str =~ /\.(\w+)\s+([a-f0-9]+)\s+([a-f0-9]+)\s+([a-f0-9]+)\s+([a-f0-9]+)/i
+  ret = {
+      name: $1,
+      size: $2.to_i(16),
+      vma:  $3.to_i(16),
+      lma:  $4.to_i(16),
+      file_off: $5.to_i(16)
+  }
+  ret[:name] =~ /data/ ? ret : nil
+end
+def parse_data_section_headers(str)
+  ret = []
+  str.split("\n").each do |line|
+    header = parse_data_section_header(line)
+    ret << header if header
+  end
+  ret
+end
 
 text = parse_section_header(section_headers, 'text')
 raise 'text section headers error' unless text
-rodata = parse_section_header(section_headers, 'rodata')
-bss = parse_section_header(section_headers, 'bss')
-data = parse_section_header(section_headers, 'data')
+# rodata = parse_section_header(section_headers, 'rodata')
+# bss = parse_section_header(section_headers, 'bss')
+# data = parse_section_header(section_headers, 'data')
+headers = parse_data_section_headers(section_headers)
 
 # parse section content
 def hex_str_to_binary(hexstr)
@@ -76,10 +96,53 @@ def parse_section_content(str, section_name)
   end
   content
 end
+
+def parse_data_sections(str)
+  started = false
+  current_section = nil
+  current_section_start = nil
+  data_sections = []
+  content = nil
+  str.split("\n").each do |line|
+    if line =~ /Contents of section \.(\w+):/
+      name = $1
+
+      if started
+        data_sections << { name: current_section, content: content, start: current_section_start }
+        started = false
+        current_section = nil
+        current_section_start = nil
+      end
+
+      if name =~ /data/
+        started = true
+        content = ''
+        current_section = name
+      end
+    end
+
+    if started && line =~ /^ \d+/
+      addr, *line_data_array = line.split(' ')[0..4]
+      current_section_start = addr.to_i(16) unless current_section_start
+      line_data_array.reject! { |l| ! (l =~ /^[0-9a-f]+$/i)}
+      line_data = line_data_array.join('')
+      content += hex_str_to_binary(line_data)
+    end
+  end
+  data_sections
+end
+
 #puts section_content
+
 text[:content] = parse_section_content(section_content, 'text')
-data[:content] = parse_section_content(section_content, 'data') if data
-rodata[:content] = parse_section_content(section_content, 'rodata') if rodata
+sections = parse_data_sections(section_content)
+
+sections.map! do |section|
+  name = section[:name]
+  start = section[:start]
+  header = headers.find { |x| x[:name] == name && x[:vma] == start }
+  section.merge(header) if header
+end
 
 def gen_v9_header(entry_point, data_offset)
   [0xC0DEF00D].pack('L') +      # magic
@@ -95,7 +158,7 @@ end
 
 def fill_section(file_data, section)
   if section[:content]
-    file_data[section[:vma]...(section[:vma]+section[:size])] =
+    file_data[section[:vma], section[:size]] =
       section[:content]
   end
 end
@@ -104,7 +167,7 @@ end
 main_file = @dbg_lines.keys.first
 extended_header = gen_v9_extended_header(main_file)
 
-last_section = ([text, bss, data, rodata].compact.sort_by { |section| section[:vma] }).last
+last_section = (sections.sort_by { |section| section[:vma] }).last
 file_size = last_section[:vma] + last_section[:size]
 
 file_data = ([0]*file_size).pack('C*')
@@ -112,9 +175,12 @@ file_data = ([0]*file_size).pack('C*')
 header = gen_v9_header(entry_point, text[:vma]+text[:size])
 
 # 假设text是第一个段, 把附加数据放在text段之前这段不使用的空间
-file_data[text[:vma] - extended_header.size...text[:vma]] = extended_header
-fill_section(file_data, text)
-fill_section(file_data, rodata) if rodata
-fill_section(file_data, data) if data
 
-File.write(outfile, header + file_data)
+file_data[0, header.size] = header
+file_data[header.size, extended_header.size] = extended_header
+fill_section(file_data, text)
+sections.each do |section|
+  fill_section(file_data, section)
+end
+
+File.write(outfile, file_data)
