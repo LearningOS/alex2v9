@@ -1,4 +1,4 @@
-
+require 'pathname'
 def parse_debug_lines(infile)
   ###########################################
   ## Line number and pc
@@ -12,8 +12,8 @@ def parse_debug_lines(infile)
   current_file = nil
   dbg_lines = {}
   info.each_line do |line|
-    if line =~ /^CU:\s+(.*):.*$/
-      current_file = $1
+    if line =~ /^(CU:\s+)?(\/.*):$/
+      current_file = Pathname.new($2).relative_path_from(Pathname.new(__FILE__)).to_s
     elsif line =~/^\s*$/
     elsif current_file
       file, lineno, addr = line.split
@@ -27,4 +27,16 @@ def parse_debug_lines(infile)
   end
 
   dbg_lines
+end
+
+def get_entry_point_file(dbg_lines, address)
+  dbg_lines.each do |filename, lines|
+    last_addr = lines.first.last
+    lines.each do |_line, addr|
+      if last_addr <= address && address < addr
+        return filename
+      end
+    end
+  end
+  nil
 end

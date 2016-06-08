@@ -1,4 +1,5 @@
 #!/usr/bin/env ruby
+require_relative 'debug_lines'
 infile = ARGV[0]
 outfile = ARGV[1]
 unless infile && outfile
@@ -66,7 +67,6 @@ def parse_section_content(str, section_name)
       end
     end
 
-
     if started && line =~ /^ \d+/
       line_data_array = line.split(' ')[1..4]
       line_data_array.reject! { |l| ! (l =~ /^[0-9a-f]+$/i)}
@@ -83,10 +83,16 @@ rodata[:content] = parse_section_content(section_content, 'rodata') if rodata
 
 def gen_v9_header(entry_point, data_offset)
   [0xC0DEF00D].pack('L') +      # magic
-    ([0] * 4).pack('C*') +      # bss
+    [0].pack('L') +             # bss
     [entry_point].pack('L') +   # text
     [data_offset].pack('L')     # data
 end
+
+def gen_v9_extended_header(filename)
+  [0xFF2017FF].pack('L') +
+      filename + [0].pack('C')
+end
+
 def fill_section(file_data, section)
   if section[:content]
     file_data[section[:vma]...(section[:vma]+section[:size])] =
@@ -94,12 +100,19 @@ def fill_section(file_data, section)
   end
 end
 
+@dbg_lines = parse_debug_lines(infile)
+main_file = @dbg_lines.keys.first
+extended_header = gen_v9_extended_header(main_file)
+
 last_section = ([text, bss, data, rodata].compact.sort_by { |section| section[:vma] }).last
 file_size = last_section[:vma] + last_section[:size]
 
 file_data = ([0]*file_size).pack('C*')
 
 header = gen_v9_header(entry_point, text[:vma]+text[:size])
+
+# 假设text是第一个段, 把附加数据放在text段之前这段不使用的空间
+file_data[text[:vma] - extended_header.size...text[:vma]] = extended_header
 fill_section(file_data, text)
 fill_section(file_data, rodata) if rodata
 fill_section(file_data, data) if data

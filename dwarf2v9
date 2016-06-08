@@ -373,8 +373,7 @@ def get_struct_members_def(struct)
   [last_member_size + last_member_off, members_str]
 end
 
-
-out_io.puts "= #{infile}"
+out_io.puts "= #{@dbg_lines.keys.first}"
 
 # global variables
 out_io.puts '# global variables'
@@ -419,6 +418,7 @@ out_io.puts
 
 # .data and .bss start address
 elf_header = `#{OBJDUMP} -h #{infile}`
+
 def parse_section_header(str, section_name)
   return nil unless str =~ /\.#{section_name}\s+([a-f0-9]+)\s+([a-f0-9]+)\s+([a-f0-9]+)\s+([a-f0-9]+)/i
   {
