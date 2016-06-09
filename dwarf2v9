@@ -63,7 +63,13 @@ end
 
 def parse_type_offset(off)
   if off && off.key?(:value)
-    off[:value].strip[1...-1].to_i(16)
+    if off[:value] =~ /0x([a-f0-9]+)/i
+      $1.to_i(16)
+    elsif off[:value] =~ /([0-9]+)/i
+      $1.to_i
+    else
+      raise 'format error'
+    end
   else
     -1
   end
@@ -98,10 +104,10 @@ def parse_variable(item)
 end
 
 def parse_location(loc)
-  if loc.strip.split("\t")[-1][1...-1] =~ /([\w_]+):\s+(\d+)/
+  if loc.strip.split("\t")[-1][1...-1] =~ /([\w_]+):\s+([0-9a-f]+)/i
     {
         base: $1,
-        offset: $2.to_i
+        offset: $2.to_i(16)
     }
   end
 end
@@ -375,10 +381,25 @@ end
 
 out_io.puts "= #{@dbg_lines.keys.first}"
 
+# .data and .bss start address
+elf_header = `#{OBJDUMP} -h #{infile}`
+
+def parse_section_header(str, section_name)
+  return nil unless str =~ /\.#{section_name}\s+([a-f0-9]+)\s+([a-f0-9]+)\s+([a-f0-9]+)\s+([a-f0-9]+)/i
+  {
+      size: $1.to_i(16),
+      vma:  $2.to_i(16),
+      lma:  $3.to_i(16),
+      file_off: $4.to_i(16)
+  }
+end
+bss = parse_section_header(elf_header, 'bss')
+data = parse_section_header(elf_header, 'data')
+data_segment_start = data[:vma]
 # global variables
 out_io.puts '# global variables'
 @variables.each do |name, val|
-  out_io.puts "g #{name} data +#{val[:location][:offset]} #{get_v9_type_str(val[:typeOffset])}"
+  out_io.puts "g #{name} data #{'%+d' % (val[:location][:offset] - data_segment_start)} #{get_v9_type_str(val[:typeOffset])}"
 end
 out_io.puts
 
@@ -416,21 +437,5 @@ out_io.puts '# structures'
 end
 out_io.puts
 
-# .data and .bss start address
-elf_header = `#{OBJDUMP} -h #{infile}`
-
-def parse_section_header(str, section_name)
-  return nil unless str =~ /\.#{section_name}\s+([a-f0-9]+)\s+([a-f0-9]+)\s+([a-f0-9]+)\s+([a-f0-9]+)/i
-  {
-      size: $1.to_i(16),
-      vma:  $2.to_i(16),
-      lma:  $3.to_i(16),
-      file_off: $4.to_i(16)
-  }
-end
-bss = parse_section_header(elf_header, 'bss')
-data = parse_section_header(elf_header, 'data')
-
-
 out_io.puts ".data 0x#{data[:vma].to_s(16)}"
-out_io.puts ".bss 0x#{bss[:vma].to_s(16)}"
+out_io.puts ".bss 0x#{(bss[:vma]+bss[:size]).to_s(16)}" # because we never use bss

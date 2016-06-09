@@ -180,7 +180,11 @@ file_data[0, header.size] = header
 file_data[header.size, extended_header.size] = extended_header
 fill_section(file_data, text)
 sections.each do |section|
-  fill_section(file_data, section)
+  if section[:name] =~ /bss/
+    file_data[section[:vma], section[:size]] = ([0] * section[:size]).pack('C*')
+  else
+    fill_section(file_data, section)
+  end
 end
 
 File.write(outfile, file_data)
